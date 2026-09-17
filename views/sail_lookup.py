@@ -17,6 +17,23 @@ TAPE_ID_COLUMNS = {
 
 
 def render() -> None:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stMetricValue"] {
+            font-size: 1.15rem;
+            line-height: 1.3;
+            white-space: normal;
+            overflow-wrap: break-word;
+        }
+        div[data-testid="stMetricLabel"] {
+            font-size: 0.8rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("🔍 Order & Tape Lookup")
     st.caption("Search by order number (OEN) to see its material breakdown, or by tape ID to see every order that uses it.")
     st.divider()
