@@ -42,6 +42,6 @@ with st.sidebar:
     page_name = st.radio("Navigation", list(PAGES.keys()), label_visibility="collapsed")
 
     st.divider()
-    st.caption("More pages (reorder alerts, order planner) are on hold pending confirmation of source dates.")
+    st.caption("More pages (reorder alerts, order planner) are on hold pending confirmation of remaining lead-time stages and tape stock data.")
 
 PAGES[page_name]()
