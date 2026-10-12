@@ -19,24 +19,26 @@ PAGES = {
 
 with st.sidebar:
     st.markdown("### ⛵ North Sails")
-    st.caption("Inventory & Weekly Demand")
+    st.caption("Inventory & Weekly Demand · v3 (weeks from Sail List)")
     st.divider()
 
     st.markdown("**Data source**")
     upload = st.file_uploader("Upload the Sail Plan workbook", type=["xlsx", "xls"], label_visibility="collapsed")
+
+    # Re-run the (cached) loader on every run instead of trusting data saved in
+    # the session, so a code update can never leave stale results on screen.
     if upload is not None:
-        payload = upload.getvalue()
-        if st.session_state.get("_upload_name") != upload.name or st.session_state.get("_upload_size") != len(payload):
-            try:
-                st.session_state["sail_data"] = load_sail_data(payload)
-                st.session_state["_upload_name"] = upload.name
-                st.session_state["_upload_size"] = len(payload)
-            except Exception as exc:
-                st.error(f"Couldn't read that file: {exc}")
+        try:
+            st.session_state["sail_data"] = load_sail_data(upload.getvalue())
+        except Exception as exc:
+            st.session_state.pop("sail_data", None)
+            st.error(f"Couldn't read that file: {exc}")
+    else:
+        st.session_state.pop("sail_data", None)
 
     data = st.session_state.get("sail_data")
     if data is not None:
-        st.success(f"Loaded — {len(data.weeks)} weeks, {len(data.inventory)} tape IDs")
+        st.success(f"Loaded — {len(data.weeks)} week(s), {len(data.inventory)} tape IDs")
 
     st.divider()
     st.markdown("**Navigation**")
