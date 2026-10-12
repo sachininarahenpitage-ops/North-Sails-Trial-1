@@ -1,20 +1,21 @@
 """Loading and shaping the North Sails workbook for the Demand and Inventory tabs.
 
-Two different sheets feed two different tabs:
+Everything now comes from the 'Sail List' sheet:
 
-  'Sheet'      -> Demand tab. Laid out as repeating blocks, each starting with
-                  a marker row ("week 27", "week 28", ...) in the OE column,
-                  followed by order rows for that week (mixed in with
-                  category-header rows like "OCEAN & ENDURANCE" and some
-                  pre-existing manual calculation rows - "requirement CS",
-                  "stock", "pregger1..5", "left" - which we deliberately
-                  leave untouched and don't try to reinterpret). Only rows
-                  whose OE value matches an order-number pattern are treated
-                  as real demand.
+  * Order rows  -> one row per sail order. The 'week' column (added by the
+                   supervisor) says which production week the order belongs to.
+                   These feed the Demand tab.
+  * Stock rows  -> two special rows at the bottom whose OE value is
+                   "Stock (Adcote)" / "Stock (Morchem)". They hold current
+                   on-hand stock per tape ID, split by resin. These feed the
+                   Inventory tab.
 
-  'Sail List'  -> Inventory tab. Same tape-ID columns, but two special rows
-                  at the bottom (OE = "Stock (Adcote)" / "Stock (Morchem)")
-                  hold current on-hand stock per tape ID, split by resin.
+Columns are located by header name, not by position, so inserting or moving
+columns (like the new 'week' column) doesn't break the loader. Every column
+to the right of 'OE' is treated as a tape-ID column.
+
+The old 'Sheet' tab (with its "week 27 ... week 37" marker rows) is no longer
+read: those week numbers were found to be incorrect.
 
 Tape ID classification (4th character of the 6-character base code):
   '1' -> Internal Raw      'M' -> Internal Myler
@@ -32,10 +33,9 @@ from dataclasses import dataclass
 import pandas as pd
 import streamlit as st
 
-DEMAND_SHEET = "Sheet"
-STOCK_SHEET = "Sail List"
+SHEET_NAME = "Sail List"
+REQUIRED_COLUMNS = ["OE", "week", "Boat Type", "Tyre", "Internal", "External"]
 
-WEEK_PATTERN = re.compile(r"^week\s*(\d+)", re.IGNORECASE)
 OEN_PATTERN = re.compile(r"^[A-Za-z0-9]+[-_]\d{3}$")
 
 RESIN_CURING_DAYS = {"adcote": 8, "morchem": 12}
@@ -71,11 +71,12 @@ def classify_tape(tape_id: str) -> str:
 class SailData:
     demand: pd.DataFrame     # week, oen, boat_type, tyre, tape_id, type, quantity
     inventory: pd.DataFrame  # tape_id, type, stock_adcote, stock_morchem, total_stock
-    orders: pd.DataFrame     # oen, internal, external, resin_type — one row per order
+    orders: pd.DataFrame     # oen, week, internal, external, resin_type — one row per order
+    unassigned_orders: int = 0  # orders with no week filled in (excluded from demand)
 
     @property
     def weeks(self) -> list[int]:
-        return sorted(self.demand["week"].dropna().unique().tolist())
+        return sorted(int(w) for w in self.demand["week"].dropna().unique())
 
     def demand_for_week(self, week: int) -> pd.DataFrame:
         return self.demand[self.demand["week"] == week]
@@ -92,96 +93,88 @@ class SailData:
     def order_resin_table(self, oens: list[str] | None = None) -> pd.DataFrame:
         """Transposed view: one column per order, first row Sail ID, second row Resin Type."""
         view = self.orders if not oens else self.orders[self.orders["oen"].isin(oens)]
-        table = pd.DataFrame(
+        return pd.DataFrame(
             [view["oen"].tolist(), view["resin_type"].tolist()],
             index=["Sail ID", "Resin Type"],
-            columns=[f"Order {i+1}" for i in range(len(view))],
+            columns=[f"Order {i + 1}" for i in range(len(view))],
         )
-        return table
+
+
+def _resin_label(internal, external) -> str:
+    if pd.isna(internal) and pd.isna(external):
+        return "—"
+    if pd.notna(internal) and pd.notna(external) and str(internal).strip().casefold() == str(external).strip().casefold():
+        return str(internal).strip()
+    parts = [str(v).strip() for v in (internal, external) if pd.notna(v)]
+    return " / ".join(parts) if parts else "—"
 
 
 @st.cache_data(show_spinner=False)
 def load_sail_data(payload: bytes) -> SailData:
-    # ---------------- Demand (from 'Sheet') ----------------------------
-    raw = pd.read_excel(io.BytesIO(payload), sheet_name=DEMAND_SHEET, header=0)
-    oe_col = raw["OE"].astype(str)
+    raw = pd.read_excel(io.BytesIO(payload), sheet_name=SHEET_NAME, header=0)
+    raw.columns = [str(c).strip() for c in raw.columns]
 
-    week_marker_idx = raw.index[oe_col.str.match(WEEK_PATTERN, na=False)].tolist()
-    week_numbers = [int(WEEK_PATTERN.match(oe_col[i]).group(1)) for i in week_marker_idx]
+    missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
+    if missing:
+        raise ValueError(f"The '{SHEET_NAME}' sheet is missing column(s): {', '.join(missing)}")
 
-    tape_cols = list(raw.columns[7:])  # Boat Type..OE occupy positions 0-6
+    # Every column to the right of 'OE' is a tape ID.
+    oe_pos = list(raw.columns).index("OE")
+    tape_cols = list(raw.columns[oe_pos + 1:])
 
-    frames = []
-    for pos, start in enumerate(week_marker_idx):
-        end = week_marker_idx[pos + 1] if pos + 1 < len(week_marker_idx) else len(raw)
-        block = raw.iloc[start + 1:end].copy()
-        block = block[block["OE"].astype(str).str.match(OEN_PATTERN, na=False)]
-        if block.empty:
-            continue
-        block["week"] = week_numbers[pos]
-        keep = ["week", "Boat Type", "Tyre", "OE"] + tape_cols
-        frames.append(block[keep])
+    oe = raw["OE"].astype(str).str.strip()
+    is_order = oe.str.match(OEN_PATTERN, na=False)
 
-    if frames:
-        combined = pd.concat(frames, ignore_index=True)
-    else:
-        combined = pd.DataFrame(columns=["week", "Boat Type", "Tyre", "OE"] + tape_cols)
+    # ---------------- Orders ------------------------------------------
+    order_rows = raw[is_order].copy()
+    order_rows["OE"] = order_rows["OE"].astype(str).str.strip()
+    order_rows["week"] = pd.to_numeric(order_rows["week"], errors="coerce")
+    order_rows = order_rows.drop_duplicates(subset="OE")
 
-    combined = combined.rename(columns={"Boat Type": "boat_type", "Tyre": "tyre", "OE": "oen"})
-    long = combined.melt(
-        id_vars=["week", "boat_type", "tyre", "oen"],
-        value_vars=[str(c) for c in tape_cols] if False else tape_cols,
-        var_name="tape_id", value_name="quantity",
-    )
+    orders = order_rows[["OE", "week", "Internal", "External"]].rename(
+        columns={"OE": "oen", "Internal": "internal", "External": "external"}
+    ).reset_index(drop=True)
+    orders["resin_type"] = [_resin_label(i, e) for i, e in zip(orders["internal"], orders["external"])]
+    unassigned = int(orders["week"].isna().sum())
+
+    # ---------------- Demand (orders with a week, melted by tape) -----
+    with_week = order_rows.dropna(subset=["week"])
+    long = with_week.melt(
+        id_vars=["week", "Boat Type", "Tyre", "OE"],
+        value_vars=tape_cols,
+        var_name="tape_id",
+        value_name="quantity",
+    ).rename(columns={"Boat Type": "boat_type", "Tyre": "tyre", "OE": "oen"})
+    long["week"] = long["week"].astype(int)
     long["tape_id"] = long["tape_id"].astype(str)
     long["quantity"] = pd.to_numeric(long["quantity"], errors="coerce")
     long = long.dropna(subset=["quantity"])
     long = long[long["quantity"] > 0].reset_index(drop=True)
     long["type"] = long["tape_id"].map(classify_tape)
 
-    # ---------------- Inventory (from 'Sail List' stock rows) -----------
-    sail_list = pd.read_excel(io.BytesIO(payload), sheet_name=STOCK_SHEET, header=0)
-    stock_tape_cols = list(sail_list.columns[9:])
-    stock_rows = sail_list[sail_list["OE"].astype(str).str.contains("Stock", case=False, na=False)]
+    # ---------------- Inventory (stock rows) --------------------------
+    stock_rows = raw[oe.str.contains("Stock", case=False, na=False)]
 
-    adcote = pd.Series(dtype=float)
-    morchem = pd.Series(dtype=float)
-    hit = stock_rows[stock_rows["OE"].astype(str).str.contains("Adcote", case=False, na=False)]
-    if not hit.empty:
-        adcote = pd.to_numeric(hit.iloc[0][stock_tape_cols], errors="coerce")
-    hit = stock_rows[stock_rows["OE"].astype(str).str.contains("Morchem", case=False, na=False)]
-    if not hit.empty:
-        morchem = pd.to_numeric(hit.iloc[0][stock_tape_cols], errors="coerce")
+    def _stock_series(resin: str) -> pd.Series:
+        hit = stock_rows[stock_rows["OE"].astype(str).str.contains(resin, case=False, na=False)]
+        if hit.empty:
+            return pd.Series(dtype=float)
+        series = pd.to_numeric(hit.iloc[0][tape_cols], errors="coerce")
+        series.index = series.index.astype(str)
+        return series
 
-    all_tape_ids = sorted({str(c) for c in stock_tape_cols} | set(long["tape_id"].unique()))
+    adcote, morchem = _stock_series("Adcote"), _stock_series("Morchem")
+
+    all_tape_ids = sorted({str(c) for c in tape_cols} | set(long["tape_id"].unique()))
     inventory = pd.DataFrame({"tape_id": all_tape_ids})
-    inventory["stock_adcote"] = inventory["tape_id"].map(lambda t: adcote.get(t) if not adcote.empty else None)
-    inventory["stock_morchem"] = inventory["tape_id"].map(lambda t: morchem.get(t) if not morchem.empty else None)
+    inventory["stock_adcote"] = inventory["tape_id"].map(adcote) if not adcote.empty else float("nan")
+    inventory["stock_morchem"] = inventory["tape_id"].map(morchem) if not morchem.empty else float("nan")
     # min_count=1 keeps NaN when BOTH resin columns are missing, instead of
     # collapsing "no data" into a misleading 0.
     inventory["total_stock"] = inventory[["stock_adcote", "stock_morchem"]].sum(axis=1, min_count=1)
     inventory["type"] = inventory["tape_id"].map(classify_tape)
 
-    # ---------------- Orders (oen -> resin type, from 'Sail List') ------
-    order_rows = sail_list[sail_list["OE"].astype(str).str.match(OEN_PATTERN, na=False)].copy()
-    orders = order_rows[["OE", "Internal", "External"]].rename(
-        columns={"OE": "oen", "Internal": "internal", "External": "external"}
-    )
-    orders["oen"] = orders["oen"].astype(str).str.strip()
-    orders = orders.drop_duplicates(subset="oen").reset_index(drop=True)
-
-    def _resin_label(row: pd.Series) -> str:
-        internal, external = row["internal"], row["external"]
-        if pd.isna(internal) and pd.isna(external):
-            return "—"
-        if pd.notna(internal) and pd.notna(external) and str(internal).strip().casefold() == str(external).strip().casefold():
-            return str(internal).strip()
-        parts = [str(v).strip() for v in (internal, external) if pd.notna(v)]
-        return " / ".join(parts) if parts else "—"
-
-    orders["resin_type"] = orders.apply(_resin_label, axis=1)
-
-    return SailData(demand=long, inventory=inventory, orders=orders)
+    return SailData(demand=long, inventory=inventory, orders=orders, unassigned_orders=unassigned)
 
 
 def current_data() -> SailData | None:
